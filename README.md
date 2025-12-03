@@ -10,7 +10,7 @@
 ## Level 2
 
 1. **Scan(key string) []string** 
- - Should return a list of strings representing the fields of a record associated with the key. The returned list should be in the following format ["<field1>(<value1>)" , "<field2>(<value2>)", ...] where the fields are lexicographically sorted. If specified record doesn't exist, return empty list.
+ - Should return a list of strings representing the fields of a record associated with the key. The returned list should be in the following format [["field1(value1)" , "field2(value2)", ...]] where the fields are lexicographically sorted. If specified record doesn't exist, return empty list.
 
 2. **ScanByPrefix(key, prefix string) : []string** 
 - Should return a list of strings representing some fields of a records associated with the key. Specifically, only fields that starts with the prefix should be included. The returned list should be the same format as the Scan operation with the fields sorted in lexicographical order.
