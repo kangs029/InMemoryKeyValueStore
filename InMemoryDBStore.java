@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Stack;
 import java.util.TreeMap;
 
 public class InMemoryDBStore {
@@ -11,6 +12,10 @@ public class InMemoryDBStore {
     
     // TreeMap stores timestamp -> FieldValue to enable efficient time-based queries
     private final Map<String, Map<String, TreeMap<Integer, FieldValue>>> fieldHistory; //key -> (field -> TreeMap<timestamp, FieldValue>)
+
+    // Level 4: Undo/Redo support
+    private final Stack<DatabaseState> undoStack;
+    private final Stack<DatabaseState> redoStack;
 
     // Helper class to store field value with optional TTL
     private static class FieldValue {
@@ -21,18 +26,63 @@ public class InMemoryDBStore {
             this.value = value;
             this.ttlExpiry = ttlExpiry;
         }
+        // Deep copy constructor
+        FieldValue(FieldValue other) {
+            this.value = other.value;
+            this.ttlExpiry = other.ttlExpiry;
+        }
 
         boolean isExpiredAt(int timestamp) {
             return ttlExpiry != null && timestamp > ttlExpiry;
         }
     }
 
+    // Helper class to store database state snapshot for undo/redo
+    private static class DatabaseState {
+        final Map<String, Map<String, String>> databaseSnapshot;
+        final Map<String, Map<String, TreeMap<Integer, FieldValue>>> historySnapshot;
+
+        DatabaseState(Map<String, Map<String, String>> db, Map<String, Map<String, TreeMap<Integer, FieldValue>>> hist) {
+            // Deep copy database
+            this.databaseSnapshot = deepCopyDatabase(db);
+            // Deep copy history
+            this.historySnapshot = deepCopyHistory(hist);
+        }
+
+        private static Map<String, Map<String, String>> deepCopyDatabase(Map<String, Map<String, String>> original) {
+            Map<String, Map<String, String>> copy = new HashMap<>();
+            for (Map.Entry<String, Map<String, String>> entry : original.entrySet()) {
+                copy.put(entry.getKey(), new HashMap<>(entry.getValue()));
+            }
+            return copy;
+        }
+
+        private static Map<String, Map<String, TreeMap<Integer, FieldValue>>> deepCopyHistory(Map<String, Map<String, TreeMap<Integer, FieldValue>>> original) {
+            Map<String, Map<String, TreeMap<Integer, FieldValue>>> copy = new HashMap<>();
+            for (Map.Entry<String, Map<String, TreeMap<Integer, FieldValue>>> keyEntry : original.entrySet()) {
+                Map<String, TreeMap<Integer, FieldValue>> fieldMap = new HashMap<>();
+                for (Map.Entry<String, TreeMap<Integer, FieldValue>> fieldEntry : keyEntry.getValue().entrySet()) {
+                    TreeMap<Integer, FieldValue> timeline = new TreeMap<>();
+                    for (Map.Entry<Integer, FieldValue> timeEntry : fieldEntry.getValue().entrySet()) {
+                        timeline.put(timeEntry.getKey(), new FieldValue(timeEntry.getValue()));
+                    }
+                    fieldMap.put(fieldEntry.getKey(), timeline);
+                }
+                copy.put(keyEntry.getKey(), fieldMap);
+            }
+            return copy;
+        }
+    }
+
     public InMemoryDBStore() {
         this.store=new HashMap<>();
         this.fieldHistory=new HashMap<>();
+        this.undoStack = new Stack<>();
+        this.redoStack = new Stack<>();
     }
 
     public void Set(String key,String field,String value){
+        saveStateForUndo();
         store.computeIfAbsent(key, k->new HashMap<>()).put(field,value);
     }
 
@@ -47,6 +97,8 @@ public class InMemoryDBStore {
         if (!store.get(key).containsKey(field)) return false;
 
         Map<String, String> record = store.get(key);
+        if(!record.containsKey(field)) return false;
+        saveStateForUndo();
         record.remove(field);
 
         return true;
@@ -137,6 +189,7 @@ public class InMemoryDBStore {
         if (key == null || field == null || value == null) {
             return;
         }
+        saveStateForUndo();
         // Update old database
         Set(key,field, value);
 
@@ -162,7 +215,7 @@ public class InMemoryDBStore {
         if (key == null || field == null || value == null || ttl<0) {
             return;
         }
-
+        saveStateForUndo();
         // Update old database
         Set(key,field, value);
 
@@ -184,7 +237,7 @@ public class InMemoryDBStore {
     public boolean deleteAt(String key, String field, int timestamp) {
         String val=getFieldValueAt(key,field,timestamp);
         if(val==null) return false;
-
+        saveStateForUndo();
         // delete field in old database
         delete(key,field);
         
@@ -295,6 +348,63 @@ public class InMemoryDBStore {
         return result;
     }
 
+    // Helper method to save current state for undo
+    private void saveStateForUndo() {
+        undoStack.push(new DatabaseState(store, fieldHistory));
+        // Clear redo stack when new operation is performed
+        redoStack.clear();
+    }
+
+    // Helper method to restore state
+    private void restoreState(DatabaseState state) {
+        store.clear();
+        store.putAll(state.databaseSnapshot);
+        fieldHistory.clear();
+        fieldHistory.putAll(state.historySnapshot);
+    }
+
+    /**
+     * Level 4: Undo operation
+     * Restores the database to the previous state before the last operation.
+     * 
+     * @return true if undo was successful, false if there's nothing to undo
+     */
+    public boolean undo() {
+        if (undoStack.isEmpty()) {
+            return false;
+        }
+
+        // Save current state to redo stack
+        redoStack.push(new DatabaseState(store, fieldHistory));
+
+        // Restore previous state
+        DatabaseState previousState = undoStack.pop();
+        restoreState(previousState);
+
+        return true;
+    }
+
+    /**
+     * Level 4: Redo operation
+     * Restores the database to the state after the last undo operation.
+     * 
+     * @return true if redo was successful, false if there's nothing to redo
+     */
+    public boolean redo() {
+        if (redoStack.isEmpty()) {
+            return false;
+        }
+
+        // Save current state to undo stack
+        undoStack.push(new DatabaseState(store, fieldHistory));
+
+        // Restore next state
+        DatabaseState nextState = redoStack.pop();
+        restoreState(nextState);
+
+        return true;
+    }
+
     public static void main(String[] args) {
         InMemoryDBStore db = new InMemoryDBStore();
 
@@ -368,6 +478,43 @@ public class InMemoryDBStore {
         System.out.println("deleteAt(user1, email, 50): " + db3.deleteAt("user1", "temp",45)); // Should print: false -> since expired
         System.out.println("getAt(user1, email, 55): " + db3.getAt("user1", "email", 55)); // Should print: null (deleted)
         System.out.println("getAt(user1, email, 45): " + db3.getAt("user1", "email", 45)); // Should print: alice@example.com (before deletion)
+
+        // Test Level 4 operations
+        System.out.println("\n=== Level 4 Tests ===");
+
+        InMemoryDBStore db4 = new InMemoryDBStore();
+
+        db4.Set("user1", "name", "Alice");
+        db4.Set("user1", "email", "alice@example.com");
+        System.out.println("After setting name and email:");
+        System.out.println("  get(user1, name): " + db4.Get("user1", "name"));
+        System.out.println("  get(user1, email): " + db4.Get("user1", "email"));
+
+        // Test Undo
+        System.out.println("\nUndo last operation (delete email):");
+        boolean undoResult = db4.undo();
+        System.out.println("  undo(): " + undoResult);
+        System.out.println("  get(user1, name): " + db4.Get("user1", "name"));
+        System.out.println("  get(user1, email): " + db4.Get("user1", "email"));
+
+        // Test Redo
+        System.out.println("\nRedo (restore email):");
+        boolean redoResult = db4.redo();
+        System.out.println("  redo(): " + redoResult);
+        System.out.println("  get(user1, name): " + db4.Get("user1", "name"));
+        System.out.println("  get(user1, email): " + db4.Get("user1", "email"));
+
+        // Test multiple undos
+        System.out.println("\nUndo again (remove email):");
+        db4.undo();
+        System.out.println("  get(user1, email): " + db4.Get("user1", "email"));
+
+        System.out.println("\nUndo again (remove name):");
+        db4.undo();
+        System.out.println("  get(user1, name): " + db4.Get("user1", "name"));
+
+        System.out.println("\nTry undo when nothing to undo:");
+        System.out.println("  undo(): " + db4.undo());
 
     }
 }
